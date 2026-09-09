@@ -1,0 +1,135 @@
+name: Export JForex Ticks (year by year)
+
+# For long ranges (e.g. 2010..2020) a single job will hit the 6-hour limit.
+# This workflow runs one job per year in parallel, each producing its own file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      instrument:
+        description: "Instrument (e.g. EURUSD, BTCUSD)"
+        required: true
+        default: "dollaridxusd"
+      years:
+        description: 'JSON list of years, e.g. ["2010","2011","2012"]'
+        required: true
+        default: '["2010","2011","2012","2013","2014"]'
+      account_type:
+        description: "DEMO or LIVE"
+        required: false
+        default: "DEMO"
+      publish_release:
+        description: "Also publish each year as a GitHub Release asset"
+        required: false
+        type: boolean
+        default: true
+
+env:
+  # Dukascopy is behind Cloudflare and 403/404s the default Java user agent.
+  JNLP_USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      years: ${{ steps.set.outputs.years }}
+    steps:
+      - id: set
+        run: echo "years=${{ github.event.inputs.years }}" >> "$GITHUB_OUTPUT"
+
+  export:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write      # needed to create/update the release
+    strategy:
+      fail-fast: false
+      max-parallel: 2   # be gentle with the Dukascopy history feed
+      matrix:
+        year: ${{ fromJSON(needs.prepare.outputs.years) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+
+      - run: mvn -B -ntp -U clean package
+
+      - name: Pre-flight JNLP check
+        env:
+          ACCOUNT_TYPE: ${{ github.event.inputs.account_type || 'DEMO' }}
+        run: |
+          if [ "$ACCOUNT_TYPE" = "LIVE" ]; then
+            URL="https://www.dukascopy.com/client/live/jclient/jforex.jnlp"
+          else
+            URL="https://www.dukascopy.com/client/demo/jclient/jforex.jnlp"
+          fi
+          echo "Probing $URL"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -L \
+            -A "$JNLP_USER_AGENT" --max-time 30 "$URL" || echo "000")
+          echo "JNLP HTTP status: $CODE"
+          if [ "$CODE" != "200" ]; then
+            echo "::warning::JNLP descriptor returned HTTP $CODE. Dukascopy is most likely blocking this runner IP."
+          fi
+
+      - name: Export ${{ matrix.year }}
+        env:
+          DUKASCOPY_USERNAME: ${{ secrets.DUKASCOPY_USERNAME }}
+          DUKASCOPY_PASSWORD: ${{ secrets.DUKASCOPY_PASSWORD }}
+          DUKASCOPY_ACCOUNT_TYPE: ${{ github.event.inputs.account_type || 'DEMO' }}
+          DUKASCOPY_JNLP: ${{ vars.DUKASCOPY_JNLP }}
+          DUKASCOPY_JNLP_FALLBACKS: ${{ vars.DUKASCOPY_JNLP_FALLBACKS }}
+          HTTP_USER_AGENT: ${{ env.JNLP_USER_AGENT }}
+          CONNECT_RETRIES: "5"
+          INSTRUMENT: ${{ github.event.inputs.instrument }}
+          DATE_FROM: ${{ matrix.year }}-01-01 00:00:00
+          DATE_TO: ${{ matrix.year }}-12-31 23:59:59
+          OUT_FILE: out/${{ github.event.inputs.instrument }}_ticks_${{ matrix.year }}.csv.gz
+          CHUNK_HOURS: "6"
+          GZIP: "true"
+          RUN_TIMEOUT_HOURS: "5"
+        run: java -Xmx2g -jar target/tick-exporter.jar
+
+      - name: Upload ${{ matrix.year }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ticks-${{ github.event.inputs.instrument }}-${{ matrix.year }}
+          path: out/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      # One release per year keeps parallel matrix jobs from racing each other.
+      - name: Publish ${{ matrix.year }} to a GitHub Release
+        if: success() && github.event.inputs.publish_release != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTRUMENT: ${{ github.event.inputs.instrument }}
+          YEAR: ${{ matrix.year }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(out/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::out/ is empty, nothing to publish."
+            exit 0
+          fi
+
+          TAG="ticks-${INSTRUMENT}-${YEAR}"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "${INSTRUMENT} ticks ${YEAR}" \
+              --notes "Tick export for ${YEAR}, produced by run #${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:7}).
+
+          - Columns: \`GmtTime,Bid,Ask,BidVolume,AskVolume\`
+          - All timestamps are GMT."
+          fi
+
+          gh release upload "$TAG" "${files[@]}" --clobber
+          echo "Release: $(gh release view "$TAG" --json url -q .url)"
