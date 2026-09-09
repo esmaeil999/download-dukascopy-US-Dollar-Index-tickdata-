@@ -1,0 +1,145 @@
+name: Export JForex Ticks
+
+on:
+  workflow_dispatch:
+    inputs:
+      instrument:
+        description: "Instrument (e.g. EURUSD, GBPUSD, XAUUSD, BTCUSD)"
+        required: true
+        default: "dollaridxusd"
+      date_from:
+        description: "Start, GMT (yyyy-MM-dd HH:mm:ss). Crypto history starts ~2018"
+        required: true
+        default: "2010-01-01 00:00:00"
+      date_to:
+        description: "End, GMT (yyyy-MM-dd HH:mm:ss)"
+        required: true
+        default: "2010-02-01 00:00:00"
+      chunk_hours:
+        description: "Hours per history request"
+        required: false
+        default: "6"
+      account_type:
+        description: "DEMO or LIVE"
+        required: false
+        default: "DEMO"
+      publish_release:
+        description: "Also publish the output as a GitHub Release asset"
+        required: false
+        type: boolean
+        default: true
+  # Optional scheduled run using the repo variables/defaults (disabled by default)
+  # schedule:
+  #   - cron: "0 3 * * 1"
+
+env:
+  # Dukascopy is behind Cloudflare and 403/404s the default Java user agent.
+  JNLP_USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # GitHub hard limit for a job is 6h
+    permissions:
+      contents: write      # needed to create/update the release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+
+      - name: Build
+        run: mvn -B -ntp -U clean package
+
+      - name: Pre-flight JNLP check
+        id: jnlp
+        env:
+          ACCOUNT_TYPE: ${{ github.event.inputs.account_type || 'DEMO' }}
+        run: |
+          if [ "$ACCOUNT_TYPE" = "LIVE" ]; then
+            URL="https://www.dukascopy.com/client/live/jclient/jforex.jnlp"
+          else
+            URL="https://www.dukascopy.com/client/demo/jclient/jforex.jnlp"
+          fi
+          echo "Probing $URL"
+          curl -sSI -L -A "$JNLP_USER_AGENT" --max-time 30 "$URL" || true
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -L \
+            -A "$JNLP_USER_AGENT" --max-time 30 "$URL" || echo "000")
+          echo "JNLP HTTP status: $CODE"
+          echo "status=$CODE" >> "$GITHUB_OUTPUT"
+          if [ "$CODE" != "200" ]; then
+            echo "::warning::JNLP descriptor returned HTTP $CODE. Dukascopy is most likely blocking this runner IP (datacenter range). The Java client will still retry; if it fails, run from another network."
+          fi
+
+      - name: Run tick export
+        env:
+          DUKASCOPY_USERNAME: ${{ secrets.DUKASCOPY_USERNAME }}
+          DUKASCOPY_PASSWORD: ${{ secrets.DUKASCOPY_PASSWORD }}
+          DUKASCOPY_ACCOUNT_TYPE: ${{ github.event.inputs.account_type || 'DEMO' }}
+          DUKASCOPY_JNLP: ${{ vars.DUKASCOPY_JNLP }}
+          DUKASCOPY_JNLP_FALLBACKS: ${{ vars.DUKASCOPY_JNLP_FALLBACKS }}
+          HTTP_USER_AGENT: ${{ env.JNLP_USER_AGENT }}
+          CONNECT_RETRIES: "5"
+          INSTRUMENT: ${{ github.event.inputs.instrument || 'EURUSD' }}
+          DATE_FROM: ${{ github.event.inputs.date_from || '2010-01-01 00:00:00' }}
+          DATE_TO: ${{ github.event.inputs.date_to || '2010-02-01 00:00:00' }}
+          CHUNK_HOURS: ${{ github.event.inputs.chunk_hours || '6' }}
+          SLEEP_MS: "500"
+          GZIP: "true"
+          RUN_TIMEOUT_HOURS: "5"
+        run: java -Xmx2g -jar target/tick-exporter.jar
+
+      - name: Show output files
+        if: always()
+        run: ls -lh out || true
+
+      - name: Upload CSV artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ticks-${{ github.event.inputs.instrument || 'EURUSD' }}-${{ github.run_number }}
+          path: out/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Artifacts expire and require a GitHub login to download; a release asset
+      # is permanent and directly downloadable.
+      - name: Publish output to a GitHub Release
+        if: success() && github.event.inputs.publish_release != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTRUMENT: ${{ github.event.inputs.instrument || 'EURUSD' }}
+          DATE_FROM: ${{ github.event.inputs.date_from || '2010-01-01 00:00:00' }}
+          DATE_TO: ${{ github.event.inputs.date_to || '2010-02-01 00:00:00' }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(out/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::out/ is empty, nothing to publish."
+            exit 0
+          fi
+
+          FROM_DAY="${DATE_FROM:0:10}"
+          TO_DAY="${DATE_TO:0:10}"
+          TAG="ticks-${INSTRUMENT}-${FROM_DAY}_${TO_DAY}"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "${INSTRUMENT} ticks ${FROM_DAY} -> ${TO_DAY}" \
+              --notes "Tick export produced by run #${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:7}).
+
+          - Instrument: \`${INSTRUMENT}\`
+          - Range (GMT): \`${DATE_FROM}\` -> \`${DATE_TO}\`
+          - Columns: \`GmtTime,Bid,Ask,BidVolume,AskVolume\`
+          - All timestamps are GMT."
+          fi
+
+          gh release upload "$TAG" "${files[@]}" --clobber
+          echo "Release: $(gh release view "$TAG" --json url -q .url)"
